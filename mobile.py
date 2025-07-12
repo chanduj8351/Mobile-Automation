@@ -3,10 +3,18 @@ import json
 import os
 import re
 from time import sleep
-import sqlite3
+import time
 import logging
 from typing import Optional, List, Dict, Any
-from pathlib import Path
+import sys
+import pygetwindow as gw
+from playsound import playsound
+from functools import lru_cache
+
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
+from models.openai import Gpt  
+from core.stt import telugu_speech_recognition
+from core.tts import telugu_speak
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -29,6 +37,10 @@ class AndroidDevice:
         self.mobile_apps_path = mobile_apps_path or self._get_default_apps_path()
         self.device_id: Optional[str] = None
         self.installed_apps_cache: Dict[str, str] = {}
+
+        self._contacts_cache = {}
+        self._cache_expiry = 0
+        self.CACHE_DURATION = 300  # 5 minutes in seconds
         
         # Load mobile apps configuration
         self._load_mobile_apps()
@@ -102,7 +114,62 @@ class AndroidDevice:
             raise AndroidDeviceError(f"ADB command failed: {e}")
         except FileNotFoundError:
             raise AndroidDeviceError(f"ADB executable not found: {self.adb_path}")
-    
+        
+
+
+    def contacts(self) -> dict:
+        if not self.device_id:
+            raise AndroidDeviceError("No device connected")
+
+        try:
+            result = subprocess.run(
+                [self.adb_path, '-s', self.device_id, 'shell', 'content', 'query',
+                '--uri', 'content://contacts/phones/'],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                encoding='utf-8'  # ✅ Ensure Unicode-safe decoding
+            )
+
+            print("returncode:", result.returncode)
+
+            if result.returncode != 0:
+                raise AndroidDeviceError(f"Failed to fetch contacts: {result.stderr}")
+
+            raw_output = result.stdout
+
+            contacts: dict[str, list[str]] = {}
+
+            for line in raw_output.strip().splitlines():
+                if line.startswith("Row:"):
+                    name, number = None, None
+                    parts = line.split(", ")
+                    for part in parts:
+                        if "display_name=" in part:
+                            name = part.split("display_name=")[1].strip()
+                        elif "number=" in part:
+                            number = part.split("number=")[1].strip()
+
+                    if name and number:
+                        # Add or append to dictionary
+                        if name in contacts:
+                            if number not in contacts[name]:
+                                contacts[name].append(number)
+                        else:
+                            contacts[name] = [number]
+
+            # ✅ Save to contacts.json with UTF-8 encoding
+            with open("assets/json/contacts.json", "w", encoding="utf-8") as f:
+                json.dump(contacts, f, indent=4, ensure_ascii=False)
+
+            print("✅ Contacts saved to contacts.json")
+            #return contacts
+
+        except Exception as e:
+            print(f"❌ Failed to fetch contacts: {e}")
+            return {}
+
+
     def get_device_id(self) -> Optional[str]:
         """Get the connected device ID with improved error handling"""
         try:
@@ -120,7 +187,7 @@ class AndroidDevice:
             logger.error(f"Error getting device ID: {e}")
             return None
     
-    def connect_device(self, ip_address = "192.168.110.241"):
+    def connect_device(self, ip_address = "192.0.0.4"):
         """Connect to the device via USB or Wi-Fi."""
         try:
             if ip_address:
@@ -329,31 +396,55 @@ class AndroidDevice:
             logger.error(f"Error taking screenshot: {e}")
             return False
     
-    def make_call(self, phone_number: str) -> bool:
-        """Make a phone call with validation"""
+    def make_call(self, contact_name: str) -> bool:
+        """
+        Make a phone call using contact name from saved contacts.json
+        Automatically cleans phone number (removes +91 and spaces).
+        """
         try:
             if not self.device_id:
                 raise AndroidDeviceError("No device connected")
+
+            contacts_file = "assets\\json\\contacts.json"
+            if not os.path.exists(contacts_file):
+                raise AndroidDeviceError("contacts.json not found. Please fetch and save contacts first.")
+
+            with open(contacts_file, "r", encoding="utf-8") as f:
+                contacts = json.load(f)
+
+            # 🔍 Match contact name (case-insensitive)
+            matched_name = next((name for name in contacts if name.lower() == contact_name.lower()), None)
+            if not matched_name:
+                raise AndroidDeviceError(f"No contact found with name '{contact_name}'.")
+
+            phone_numbers = contacts[matched_name]
+            if isinstance(phone_numbers, list):
+                phone_number = phone_numbers[0]
+            else:
+                phone_number = phone_numbers
+
+            # 🧼 Clean number: remove spaces and "+91" if present
+            phone_number = phone_number.replace(" ", "").replace("+91", "")
             
-            # Basic phone number validation
-            if not re.match(r'^[\d\+\-\(\)\s]+$', phone_number):
-                raise AndroidDeviceError("Invalid phone number format")
-            
-            logger.info(f"Dialing {phone_number}...")
-            
-            # Open dialer
+            # ✅ Validate cleaned number
+            if not re.match(r'^\d{10}$', phone_number):
+                raise AndroidDeviceError(f"Invalid phone number after cleanup: {phone_number}")
+
+            logger.info(f"📞 Dialing {matched_name}: {phone_number}")
+
             self._run_adb_command([
                 '-s', self.device_id, 'shell', 'am', 'start',
                 '-a', 'android.intent.action.CALL',
                 '-d', f'tel:{phone_number}'
             ])
-            
-            logger.info(f"Call initiated to {phone_number}")
+
+            logger.info(f"✅ Call initiated to {matched_name} ({phone_number})")
             return True
+
         except Exception as e:
-            logger.error(f"Error making call: {e}")
+            logger.error(f"❌ Error making call: {e}")
             return False
-    
+        
     def get_battery_status(self) -> Dict[str, Any]:
         """Get comprehensive battery status information"""
         try:
@@ -475,14 +566,182 @@ class AndroidDevice:
             sleep(0.6)
             self.send_text('3803')
             return True
-
         except:
-            return f"Error in Unlock the device" 
-    
+            return f"Error in Unlock the device"
+
+    def _get_incoming_number(self):
+        """Fetch incoming call number using ADB"""
+        result = subprocess.run(
+            [self.adb_path, "shell", "dumpsys", "telephony.registry"],
+            capture_output=True,
+            text=True
+        )
+        # Search for the incoming call number in the output
+        for line in result.stdout.split("\n"):
+            if "mCallIncomingNumber" in line:
+                return line.split("=")[-1].strip()  # Extract and return the number
+        return None
+
+    def monitor_incoming_calls(self):
+        print("Monitoring incoming calls...")
+        last_number = None
+
+        while True:
+            incoming_number = AndroidDevice()._get_incoming_number()
+            if incoming_number and incoming_number != last_number:
+                last_number = incoming_number
+                print(f"Incoming Call from: {incoming_number}")
+                if incoming_number:
+                    break
+                return incoming_number
+
+            sleep(3)  # Check every 3 seconds
+
+    def get_contacts(self, force_refresh: bool = False) -> Dict[str, str | List[str]]:
+        """
+        Retrieve contacts from the connected Android device using ADB.
+
+        Args:
+            force_refresh: Whether to ignore cache and fetch fresh.
+
+        Returns:
+            Dictionary of {contact_name: phone_number or [multiple_numbers]}
+        """
+        try:
+            if not self.device_id:
+                raise AndroidDeviceError("No device connected")
+
+            current_time = time.time()
+            if not force_refresh and self._contacts_cache and current_time < self._cache_expiry:
+                logger.info("Using cached contacts")
+                return self._contacts_cache
+
+            logger.info("Fetching contacts from device...")
+            result = self._run_adb_command([
+                '-s', self.device_id, 'shell', 'content', 'query',
+                '--uri', 'content://com.android.contacts/data',
+                '--projection', 'display_name:data1:mimetype',
+                '--where', "mimetype='vnd.android.cursor.item/phone_v2'"
+            ])
+
+            output = result.stdout.strip()
+            if not output:
+                logger.warning("No contacts found or access denied.")
+                return {}
+
+            contacts = {}
+
+            for line in output.splitlines():
+                if line.startswith("Row"):
+                    name_match = re.search(r'display_name=([^,]+)', line)
+                    phone_match = re.search(r'data1=([^,]+)', line)
+
+                    if name_match and phone_match:
+                        name = name_match.group(1).strip().strip('"\'')
+                        phone = phone_match.group(1).strip().strip('"\'')
+                        
+                        if name and phone and name != 'NULL' and phone != 'NULL':
+                            if name in contacts:
+                                if isinstance(contacts[name], list):
+                                    contacts[name].append(phone)
+                                else:
+                                    contacts[name] = [contacts[name], phone]
+                            else:
+                                contacts[name] = phone
+
+            self._contacts_cache = contacts
+            self._cache_expiry = current_time + self.CACHE_DURATION
+            logger.info(f"Retrieved {len(contacts)} contacts")
+
+            return contacts
+
+        except Exception as e:
+            logger.error(f"Error retrieving contacts: {e}")
+            return {}
+
+   
+    def call_assistant_mobile(self, action: bool):
+        print("📞 [AI Assistant] Monitoring for incoming calls...")
+
+        last_number = None
+
+        while True:
+            try:
+                incoming_number = self._get_incoming_number()
+
+                # Skip if no call or same number
+                if not incoming_number or incoming_number == last_number:
+                    sleep(2)
+                    continue
+
+                print(f"📲 Incoming call from: {incoming_number}")
+                last_number = incoming_number
+
+                # STEP 1: Answer the call
+                if action == True:
+                    try:
+                        print("📞 Answering the call via ADB...")
+                        sleep(3)
+                        self._run_adb_command(["-s", self.device_id, "shell", "input", "keyevent", "79"])
+                        print("✅ Call answered.")
+                    except Exception as e:
+                        print(f"❌ Failed to answer call: {e}")
+                        continue
+
+                    sleep(1)  # Give time for call audio to route
+                    print("🧠 Starting AI conversation...")
+
+                    # STEP 2: AI assistant loop
+                    playsound("assets/aud/Intro.mp3")
+                    sleep(0.5)
+                    
+                    playsound("assets/aud/first_commit.mp3")
+                    first_commit = telugu_speech_recognition()
+                    print(f"First Commit {first_commit}")
+                    if "yes" in first_commit:
+                        playsound("assets/aud/bye.mp3")
+
+                        while True:
+                            user_input = telugu_speech_recognition()
+
+                            if not user_input:
+                                silence_counter += 1
+                                if silence_counter >= 3:
+                                    print("🤐 Too much silence. Ending session.")
+                                    break
+                                continue
+                            silence_counter = 0  # reset on valid input
+
+                            print(f"🗣️ User: {user_input}")
+                            ai_reply = Gpt(user_input, "You are a helpful Telugu-speaking call assistant.")
+                            print(f"🤖 AI: {ai_reply}")
+                            telugu_speak(ai_reply)
+
+                            if any(x in user_input.lower() for x in ["bye", "చాలు", "stop", "వెళ్లాలి"]):
+                                print("👋 Ending AI session for this call.")
+                                break
+
+                        print("🔄 Waiting for next call...\n")
+                        sleep(5)
+
+                    if "no" in first_commit:
+                        print("👋 User declined assistant. Resetting for next call...")
+                        last_number = None  # Allow future calls from same number
+                        continue
+
+                if action == False:
+                    continue
+
+            except KeyboardInterrupt:
+                print("\n👋 Stopped monitoring by user.")
+                break
+            except Exception as e:
+                print(f"⚠️ Unexpected error: {e}")
+                sleep(5)
+
 
 # Example usage and testing
 if __name__ == "__main__":
     device = AndroidDevice()
-    i = device.unlock_device()
-    print(i)
-    
+    device.connect_device()
+
